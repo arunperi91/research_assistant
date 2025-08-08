@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+openai
+PyMuPDF
+numpy
+fpdf
+streamlit
+requests
+python-dotenv
+duckduckgo-search
+chromadb
+pypdf
+langchain-text-splitters
