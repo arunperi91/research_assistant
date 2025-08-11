@@ -1,24 +1,11 @@
-# backend/app.py (add imports)
-from backend.services.vector_store import ChromaVectorStore
-from backend.agents.internal_vector_agent import InternalVectorAgent
-from backend.config import DATA_DIR
-
-# Initialize Chroma on startup
-print(f"[BOOT] Initializing Chroma store at {DATA_DIR}...")
-VECTOR_STORE = ChromaVectorStore()
-ingest_summary = VECTOR_STORE.ingest_directory(DATA_DIR)
-print(f"[BOOT] Chroma ingest summary: {ingest_summary}")
-
-# Replace previous INTERNAL_AGENT with vector agent
-INTERNAL_AGENT = InternalVectorAgent(VECTOR_STORE)
-
-# backend/app.py (only showing changed parts)
-from fastapi import FastAPI, Request, Response, HTTPException
+# backend/app.py
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
-from backend.agents import planner, internal_data_agent, external_web_agent, summarizer_agent, citation_agent, image_agent, plagiarism_agent
+from .services.vector_store import ChromaVectorStore
+from backend.agents.internal_vector_agent import InternalVectorAgent
+from backend.agents import planner, external_web_agent, create_report_agent, plagiarism_agent
 from backend.services import session_service
-from backend.config import FAQ_PDF_PATH
 import os
 import tempfile
 import json
@@ -27,14 +14,25 @@ from fpdf import FPDF
 import unicodedata
 import re
 import logging
+from backend.agents.create_report_agent import Source # Import the Source dataclass
 
-
-# Setup logging to file
+# Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s %(levelname)s %(message)s',
+    format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler("backend_log.txt", encoding="utf-8"), logging.StreamHandler()]
 )
+
+# --- APPLICATION BOOT SEQUENCE ---
+print("[BOOT] Initializing application...")
+VECTOR_STORE = ChromaVectorStore()
+collection_count = VECTOR_STORE.collection.count()
+print(f"[BOOT] Connected to Chroma store. Found {collection_count} existing document chunks.")
+if collection_count == 0:
+    print("[BOOT] WARNING: The vector store is empty. Run 'python ingest.py' to add documents.")
+INTERNAL_AGENT = InternalVectorAgent(VECTOR_STORE)
+print("[BOOT] Application is ready to serve requests.")
+# --- Boot Complete ---
 
 app = FastAPI()
 app.add_middleware(
@@ -43,141 +41,287 @@ app.add_middleware(
 )
 
 def to_ascii_safe(text: str) -> str:
-    # Replace common smart punctuation first
-    text = (text.replace("'", "'")
-                .replace("'", "'")
-                .replace(""", '"')
-                .replace(""", '"')
-                .replace("—", "-")
-                .replace("–", "-"))
-    # Normalize and strip non-ASCII
+    text = (text.replace("'", "'").replace("“", '"').replace("”", '"').replace("—", "-").replace("–", "-"))
     text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    # Optional: collapse repeated whitespace
     text = re.sub(r"[ \t]+", " ", text)
     return text
 
 @app.post("/refresh_internal_index")
 async def refresh_internal_index():
-    logging.info("[REFRESH] Re-ingesting internal documents...")
-    summary = VECTOR_STORE.ingest_directory(DATA_DIR)
-    logging.info(f"[REFRESH] Summary: {summary}")
-    return JSONResponse({"status": "ok", "summary": summary})
+    logging.error("[REFRESH] This endpoint is disabled. Run 'python ingest.py' from the terminal to refresh the index.")
+    raise HTTPException(status_code=403, detail="Manual refresh is disabled. Use the 'ingest.py' script.")
 
 @app.post("/plan/")
 async def generate_plan(request: Request):
     data = await request.json()
-    logging.info(f"/plan/ request data: {data}")
-    topic = data.get("topic", "").strip()
+    topic = (data.get("topic") or "").strip()
     if not topic:
-        logging.warning("Missing 'topic' in /plan/ request")
         raise HTTPException(status_code=400, detail="Missing 'topic'")
-    plan = planner.generate_research_plan(topic)
-    logging.info(f"Generated plan: {plan}")
+    plan = planner.generate_research_plan(topic, INTERNAL_AGENT)
     sess = session_service.session_manager.get_session(request)
-    logging.info(f"Session before update: {sess}")
     sess['plan'] = plan
     sess['topic'] = topic
-    logging.info(f"Session after update: {sess}")
     return JSONResponse({"plan": plan})
+
+
+# In app.py - Add these imports at the top
+from docx import Document
+from docx.shared import Inches, Pt
+from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.style import WD_STYLE_TYPE
+import tempfile
+import os
 
 @app.post("/execute/")
 async def execute_plan(request: Request):
-    logging.info("/execute/ endpoint called")
+    sess = session_service.session_manager.get_session(request)
+    plan_from_session = sess.get('plan')
     data = await request.json()
-    logging.info(f"/execute/ request data: {data}")
-    plan = data.get('plan')
+    plan_from_body = data.get('plan')
+    plan = plan_from_body or plan_from_session
+
+    if not plan:
+        raise HTTPException(status_code=404, detail="No plan found. Please generate a plan first.")
 
     if isinstance(plan, str):
-        try:
-            plan = json.loads(plan)
-            logging.info(f"Parsed plan JSON: {plan}")
-        except Exception as e:
-            logging.error(f"Error parsing plan JSON: {e}")
-            raise HTTPException(status_code=400, detail="Plan must be valid JSON")
+        try: plan = json.loads(plan)
+        except Exception: raise HTTPException(status_code=400, detail="Plan must be valid JSON")
 
     if not isinstance(plan, dict) or 'steps' not in plan or 'topic' not in plan:
-        logging.error(f"Invalid plan format: {plan}")
         raise HTTPException(status_code=422, detail="Plan JSON missing 'topic' or 'steps'")
 
-    topic = plan['topic']
-    steps = plan['steps']
-    logging.info(f"Executing plan for topic: {topic}, steps: {steps}")
-    sess = session_service.session_manager.get_session(request)
-    logging.info(f"Session at execute: {sess}")
-
-    report_sections, sources = [], []
-
-    steps = steps[:5]
-    logging.info(f"Steps limited to: {steps}")
+    topic, steps = plan['topic'], plan['steps'][:6]
+    raw_sources = []
 
     for step in steps:
-        agent = step.get('agent')
-        query = step.get('query', '')
-        logging.info(f"Step: {step}")
-        if not query:
-            logging.warning("Skipping step with empty query")
-            continue
+        query = (step.get('query') or "").strip()
+        if not query: continue
 
         try:
-            if agent == "internal":
-                logging.info(f"Calling internal agent with query: {query}")
-                relevant = INTERNAL_AGENT.retrieve(query)
-                if relevant:
-                    report_sections.append("\n\n".join([r["text"] for r in relevant]))
-                    # Maintain rich metadata for citations
-                    for r in relevant:
-                        m = r["metadata"] or {}
-                        title = m.get("file_name", "Internal Document")
-                        page = m.get("page")
-                        where = f"p.{page}" if page else ""
-                        sources.append({
-                            "title": f"{title} {where}".strip(),
-                            "url": m.get("file_path", ""),  # local path as reference
-                            "snippet": m.get("preview", "")
-                        })
+            # Retrieve internal documents and create Source objects
+            internal_results = INTERNAL_AGENT.retrieve(query)
+            for r in internal_results:
+                meta = r.get("metadata", {})
+                raw_sources.append(
+                    Source(
+                        content=r["text"],
+                        citation=f"({meta.get('file_name', 'Internal Document')} p.{meta.get('page', 'N/A')})".strip(),
+                        source_type="internal",
+                        title=meta.get('file_name', 'Internal Document')
+                    )
+                )
 
-            elif agent == "external":
-                logging.info(f"Calling external agent with query: {query}")
-                results = external_web_agent.web_search(query)
-                logging.info(f"External agent results: {results}")
-                step_texts = [r.get('snippet', '') for r in results if r.get('snippet')]
-                if step_texts:
-                    report_sections.append("\n\n".join(step_texts))
-                sources += results
+            # Retrieve external documents and create Source objects  
+            external_results = external_web_agent.web_search(query)
+            for r in external_results:
+                if r.get('snippet'):
+                    url = r.get('url', '') or r.get('link', '')
+                    raw_sources.append(
+                        Source(
+                            content=r.get('snippet', ''),
+                            citation=f"({r.get('title', 'External Source')})",
+                            source_type="external",
+                            title=r.get('title', 'External Source'),
+                            url=url
+                        )
+                    )
         except Exception as e:
-            logging.error(f"Error in step: {step}, error: {e}")
+            logging.error(f"Error processing query '{query}': {e}")
             continue
 
-    logging.info(f"Report sections: {report_sections}")
-    logging.info(f"Sources: {sources}")
-    full_text = summarizer_agent.summarize_text(report_sections, topic)
-    logging.info(f"Summarized text: {full_text}")
-    cited_text = citation_agent.generate_citations(sources, full_text)
-    logging.info(f"Cited text: {cited_text}")
-    _ = plagiarism_agent.check_plagiarism(cited_text)
-    logging.info("Plagiarism check complete")
+    # Ensure source diversity and quality
+    sources = create_report_agent.ensure_source_diversity(raw_sources)
+    logging.info(f"Using {len(sources)} diverse sources for report generation")
 
-    pdf = FPDF()
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    # Ensure topic and cited_text are ASCII-safe
-    # This is important for PDF generation to avoid encoding issues
-    topic_safe = to_ascii_safe(topic)
-    cited_text_safe = to_ascii_safe(cited_text)
+    # Generate the full report text from the collected sources
+    full_text = create_report_agent.create_research_report(sources, topic)
 
-    pdf.set_font("Arial", "B", 16)
-    pdf.cell(0, 10, txt=topic_safe, ln=True, align="C")
-    pdf.ln(5)
+    # Validate content quality
+    validation = create_report_agent.validate_content_before_pdf(full_text, sources)
+    logging.info(f"Content validation score: {validation['quality_score']}")
+    
+    if validation["quality_score"] < 0.6:
+        logging.warning(f"Low quality score: {validation['quality_score']}. Regenerating with enhanced settings.")
+        full_text = create_report_agent.create_research_report(
+            sources, topic, enhanced_rephrasing=True
+        )
 
-    pdf.set_font("Arial", size=11)
-    for paragraph in cited_text_safe.split("\n\n"):
-        for line in textwrap.wrap(paragraph, width=100):
-            pdf.multi_cell(0, 6, line)
-        pdf.ln(2)
+    # Create professional Word document
+    doc_path = create_professional_word_doc(full_text, topic)
+    
+    # Create a safe filename
+    safe_filename = f"research_report_{topic.replace(' ', '_').lower()}.docx"
+    safe_filename = re.sub(r'[^\w\-_\.]', '', safe_filename)
+    
+    return FileResponse(
+        path=doc_path,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        filename=safe_filename,
+        headers={"Content-Disposition": f"attachment; filename={safe_filename}"}
+    )
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_pdf:
-        pdf.output(tmp_pdf.name)
-        pdf_path = tmp_pdf.name
-        logging.info(f"PDF created at: {pdf_path}")
 
-    return FileResponse(pdf_path, media_type="application/pdf", filename="research_report.pdf")
+def create_professional_word_doc(full_text: str, topic: str) -> str:
+    """Create a professionally formatted Word document"""
+    
+    doc = Document()
+    
+    # Set up document styles
+    setup_document_styles(doc)
+    
+    # Add title page
+    add_title_page(doc, topic)
+    
+    # Add page break before content
+    doc.add_page_break()
+    
+    # Process content
+    add_formatted_content(doc, full_text)
+    
+    # Save to temporary file
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".docx")
+    doc.save(temp_file.name)
+    temp_file.close()
+    
+    return temp_file.name
+
+def setup_document_styles(doc):
+    """Set up custom styles for the document"""
+    
+    styles = doc.styles
+    
+    # Create title style
+    try:
+        title_style = styles['Title']
+    except KeyError:
+        title_style = styles.add_style('Title', WD_STYLE_TYPE.PARAGRAPH)
+    
+    title_style.font.name = 'Arial'
+    title_style.font.size = Pt(24)
+    title_style.font.bold = True
+    title_style.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_style.paragraph_format.space_after = Pt(12)
+    
+    # Create heading style
+    try:
+        heading_style = styles['Heading 1']
+    except KeyError:
+        heading_style = styles.add_style('Heading 1', WD_STYLE_TYPE.PARAGRAPH)
+    
+    heading_style.font.name = 'Arial'
+    heading_style.font.size = Pt(16)
+    heading_style.font.bold = True
+    heading_style.paragraph_format.space_before = Pt(12)
+    heading_style.paragraph_format.space_after = Pt(6)
+    
+    # Create normal style
+    try:
+        normal_style = styles['Normal']
+    except KeyError:
+        normal_style = styles.add_style('Normal', WD_STYLE_TYPE.PARAGRAPH)
+    
+    normal_style.font.name = 'Arial'
+    normal_style.font.size = Pt(11)
+    normal_style.paragraph_format.space_after = Pt(6)
+    normal_style.paragraph_format.line_spacing = 1.15
+
+def add_title_page(doc, topic):
+    """Add a professional title page"""
+    
+    # Add title
+    title_para = doc.add_paragraph()
+    title_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    title_run = title_para.add_run(topic.upper())
+    title_run.font.name = 'Arial'
+    title_run.font.size = Pt(24)
+    title_run.bold = True
+    
+    # Add some space
+    doc.add_paragraph()
+    doc.add_paragraph()
+    
+    # Add subtitle
+    subtitle_para = doc.add_paragraph()
+    subtitle_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    subtitle_run = subtitle_para.add_run('Research Report')
+    subtitle_run.font.name = 'Arial'
+    subtitle_run.font.size = Pt(16)
+    
+    # Add more space
+    doc.add_paragraph()
+    doc.add_paragraph()
+    doc.add_paragraph()
+    
+    # Add date
+    date_para = doc.add_paragraph()
+    date_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    date_run = date_para.add_run('Generated on: August 11, 2025')
+    date_run.font.name = 'Arial'
+    date_run.font.size = Pt(12)
+
+def add_formatted_content(doc, full_text):
+    """Add formatted content to the document"""
+    
+    lines = full_text.split('\n')
+    i = 0
+    
+    while i < len(lines):
+        line = lines[i].strip()
+        
+        if not line:
+            i += 1
+            continue
+        
+        # Check if it's a section header (ALL CAPS)
+        if line.isupper() and len(line) > 3 and not line.startswith('['):
+            # Add section header
+            header_para = doc.add_paragraph()
+            header_run = header_para.add_run(line)
+            header_run.font.name = 'Arial'
+            header_run.font.size = Pt(16)
+            header_run.bold = True
+            header_para.paragraph_format.space_before = Pt(12)
+            header_para.paragraph_format.space_after = Pt(6)
+            
+            # Skip the dashes line if it follows
+            if i + 1 < len(lines) and lines[i + 1].strip().startswith('---'):
+                i += 1
+        
+        elif line.startswith('---'):
+            # Skip dash lines
+            pass
+        
+        else:
+            # Regular paragraph with citation handling
+            add_paragraph_with_citations(doc, line)
+        
+        i += 1
+
+def add_paragraph_with_citations(doc, text):
+    """Add a paragraph with proper citation formatting"""
+    
+    if not text.strip():
+        return
+    
+    para = doc.add_paragraph()
+    para.paragraph_format.space_after = Pt(6)
+    para.paragraph_format.line_spacing = 1.15
+    
+    # Split text by citations
+    parts = re.split(r'(\[\d+\])', text)
+    
+    for part in parts:
+        if not part:
+            continue
+        
+        if re.match(r'^\[\d+\]$', part):
+            # Add citation as superscript
+            citation_run = para.add_run(part)
+            citation_run.font.name = 'Arial'
+            citation_run.font.size = Pt(9)
+            citation_run.font.superscript = True
+        else:
+            # Add regular text
+            text_run = para.add_run(part)
+            text_run.font.name = 'Arial'
+            text_run.font.size = Pt(11)
